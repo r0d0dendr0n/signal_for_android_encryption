@@ -4,6 +4,7 @@ import json
 import sys
 import secrets
 import os
+from base64 import b64encode, b64decode
 from pathlib import Path
 from enum import Enum
 from io import BytesIO
@@ -24,6 +25,7 @@ class MACMismatchError(Exception):
     pass
 
 class UnsupportedVersionError(ValueError):
+    """Thrown if an unrecognised header version number is encountered."""
 
 def increment_initialisation_vector(initialisation_vector: bytes) -> bytes:
     counter = struct.unpack(">I", initialisation_vector[:4])[0]
@@ -186,26 +188,62 @@ def create_backup_file(backup_file: BinaryIO, passphrase: str, input_directory: 
     #     encrypted_db = encrypt_backup_frame(db_content, hmac_key, cipher_key, iv, version)
     #     iv = increment_initialisation_vector(iv)
     #     backup_file.write(encrypted_db)
-    
-    # # Write preferences: TODO
-    # preferences_path = Path(input_directory + "/" + "preferences.json")
-    # with open(preferences_path, "r") as prefs_file:
-    #     preferences = json.load(prefs_file)
-    #     preferences_data = json.dumps(preferences).encode("utf-8")
-    #     encrypted_prefs = encrypt_backup_frame(preferences_data, hmac_key, cipher_key, iv, version)
-    #     iv = increment_initialisation_vector(iv)
-    #     backup_file.write(encrypted_prefs)
+
+    # # Preferences stored as a dictionary {<file>: {<key>: {<type>: <value>, ...}, ...}, ...}
+    # preferences: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    preferences_path = Path(input_directory + "/" + "preferences.json")
+    with open(preferences_path, "r") as kv_file:
+        jsonData = json.load(kv_file)
+        for fileName, preferences in jsonData.items():
+            for optName, optProperties in preferences.items():
+                prefMsg = Backups_pb2.BackupFrame()
+                prefMsg.preference.file = fileName
+                prefMsg.preference.key = optName
+
+                for prefKey, prefValue in optProperties.items():
+                    if prefKey in ["value", "booleanValue"]:
+                        setattr(prefMsg.preference, prefKey, prefValue)
+                    if prefKey == "isStringSetValue":
+                        setattr(prefMsg.preference, prefKey, prefValue)
+                    if prefKey == "stringSetValue" and optProperties["isStringSetValue"]:
+                        prefMsg.preference.stringSetValue.append(prefValue)
+                    if prefKey == "blobValueBase64":
+                        prefMsg.keyValue.blobValue = b64decode(value["blobValueBase64"].encode("ascii"))
+            
+                serializedMsg = prefMsg.SerializeToString()
+                encrypted_att = encrypt_backup_frame(serializedMsg, hmac_key, cipher_key, iv, version)
+                iv = increment_initialisation_vector(iv)
+                backup_file.write(encrypted_att)
+
+    keyvalue_path = Path(input_directory + "/" + "key_value.json")
+    with open(keyvalue_path, "r") as kv_file:
+        jsonData = json.load(kv_file)
+        for key, value in jsonData.items():
+            kvMsg = Backups_pb2.BackupFrame()
+            kvMsg.keyValue.key = key
+            
+            valueKeys = value.keys()
+            for field in ["booleanValue", "floatValue", "integerValue", "longValue", "stringValue"]:
+                if field in valueKeys:
+                    setattr(kvMsg.keyValue, field, value[field])
+            
+            if "blobValueBase64" in valueKeys:
+                kvMsg.keyValue.blobValue = b64decode(value["blobValueBase64"].encode("ascii"))
+        
+            serializedMsg = kvMsg.SerializeToString()
+            encrypted_att = encrypt_backup_frame(serializedMsg, hmac_key, cipher_key, iv, version)
+            iv = increment_initialisation_vector(iv)
+            backup_file.write(encrypted_att)
     
     keys = Keys(
         cipher_key=cipher_key,
         hmac_key=hmac_key,
     )
 
-    # Add other files (attachments, avatars, etc.)
+    # Add other files (attachments, avatars, stickers)
     iv = writeAttachmentObj(backup_file, keys, iv, input_directory, "attachments", AttachmentType.ATTACHMENT, version)
     iv = writeAttachmentObj(backup_file, keys, iv, input_directory, "avatars", AttachmentType.AVATAR, version)
     iv = writeAttachmentObj(backup_file, keys, iv, input_directory, "stickers", AttachmentType.STICKER, version)
-    # Add similar steps for stickers, avatars, key-value files
     
     # Finalize the backup (add an end frame)
     footerFrame = Backups_pb2.BackupFrame()
