@@ -4,11 +4,11 @@ import json
 import sys
 import secrets
 import os
-from base64 import b64encode, b64decode
+from base64 import b64decode
 from pathlib import Path
 from enum import Enum
 from io import BytesIO
-from typing import NamedTuple, BinaryIO, Iterator, Union, Dict, cast
+from typing import NamedTuple, BinaryIO
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import AES
@@ -67,7 +67,7 @@ def encrypt_backup_frame(input_data: bytes, hmac_key: bytes, cipher_key: bytes, 
             hmac.update(encrypted_length_bytes)
             output_data = encrypted_length_bytes
     else:
-        raise UnsupportedVersionError(header_version)
+        raise UnsupportedVersionError(version)
 
     # print("Encrypting frame {} bytes long".format(data_length))
     #print("{}".format(input_data[0:32]))
@@ -83,7 +83,15 @@ def encrypt_backup_frame(input_data: bytes, hmac_key: bytes, cipher_key: bytes, 
     
     return output_data
 
-def encrypt_frame_payload(backup_file: BinaryIO, raw_payload: bytes, hmac_key: bytes, cipher_key: bytes, iv: bytes, chunk_size: int = 8 * 1024,) -> bytes:
+def write_encrypted_backup_frame(frame: Backups_pb2.BackupFrame, backup_file: BinaryIO, keys: Keys, iv: bytes, version: int) -> bytes:
+    serializedMsg = frame.SerializeToString()
+    encrypted_msg = encrypt_backup_frame(serializedMsg, keys.hmac_key, keys.cipher_key, iv, version)
+    print("Frame bytes: {}".format(len(serializedMsg)))
+    backup_file.write(encrypted_msg)
+    iv = increment_initialisation_vector(iv)
+    return iv
+
+def write_encrypted_frame_payload(backup_file: BinaryIO, raw_payload: bytes, hmac_key: bytes, cipher_key: bytes, iv: bytes, version: int, chunk_size: int = 8 * 1024,) -> bytes:
     """Encrypts and generates an encrypted payload."""
     hmac = HMAC(hmac_key, SHA256(), backend=DefaultBackend)
     hmac.update(iv)
@@ -97,6 +105,7 @@ def encrypt_frame_payload(backup_file: BinaryIO, raw_payload: bytes, hmac_key: b
     encryptor = cipher.encryptor()
 
     length = len(raw_payload)
+    print("  payload bytes: {}".format(length))
     payload_reader = BytesIO(raw_payload)
     ciphertext = bytes()
     # Read the data, incrementally decrypting one chunk at a time
@@ -113,7 +122,11 @@ def encrypt_frame_payload(backup_file: BinaryIO, raw_payload: bytes, hmac_key: b
 
     ciphertext += encryptor.finalize()
 
-    return ciphertext + mac
+    encrypted_payload = ciphertext + mac
+    backup_file.write(encrypted_payload)
+
+    iv = increment_initialisation_vector(iv)
+    return iv
 
 def getAttachmentObj(attachment_data: bytes, att_file: BinaryIO, attachType: AttachmentType):
     if(attachType == AttachmentType.ATTACHMENT):
@@ -144,16 +157,8 @@ def writeAttachmentObj(backup_file: BinaryIO, keys: Keys, iv: bytes, input_direc
             attachment_data = att_file.read()
             attachmentMsg = getAttachmentObj(attachment_data, att_file, attachType)
 
-            serializedMsg = attachmentMsg.SerializeToString()
-            encrypted_att = encrypt_backup_frame(serializedMsg, keys.hmac_key, keys.cipher_key, iv, version)
-            iv = increment_initialisation_vector(iv)
-            backup_file.write(encrypted_att)
-
-            encrypted_payload = encrypt_frame_payload(backup_file, attachment_data, keys.hmac_key, keys.cipher_key, iv)
-            iv = increment_initialisation_vector(iv)
-            backup_file.write(encrypted_payload)
-
-            print("Frame bytes: {}, payload bytes: {}".format(len(serializedMsg), len(attachment_data)))
+            iv = write_encrypted_backup_frame(attachmentMsg, backup_file, keys, iv, version)
+            iv = write_encrypted_frame_payload(backup_file, attachment_data, keys.hmac_key, keys.cipher_key, iv, version)
     
     return iv
 
@@ -179,18 +184,33 @@ def create_backup_file(backup_file: BinaryIO, passphrase: str, input_directory: 
     backup_file.write(headerStr)
 
     cipher_key, hmac_key = derive_keys(passphrase, salt)
+    keys = Keys(
+        cipher_key=cipher_key,
+        hmac_key=hmac_key,
+    )
 
-    # Write the database: TODO
-    # print("path: {}".format(input_directory))
-    # database_path = Path(input_directory + "/" + "database.sqlite")
-    # with open(database_path, "rb") as db_file:
-    #     db_content = db_file.read()
-    #     encrypted_db = encrypt_backup_frame(db_content, hmac_key, cipher_key, iv, version)
-    #     iv = increment_initialisation_vector(iv)
-    #     backup_file.write(encrypted_db)
+    database_path = Path(input_directory + "/" + "database.sqlite")
+    db_backup = open(input_directory + "/db_backup_enc.txt", "w")
+    con = sqlite3.connect(database_path)
+    dbUserVerMsg = Backups_pb2.BackupFrame()
+    dbUserVerMsg.version.version = version
+    db_backup.write(f"PRAGMA user_version = {version:d};\n")
+    iv = write_encrypted_backup_frame(dbUserVerMsg, backup_file, keys, iv, version)
+    for line in con.iterdump():
+        if (
+            not line.lower().startswith("create table sqlite_")
+            and not line.lower().startswith("insert into sqlite_")
+            and "sms_fts_" not in line
+            and "mms_fts_" not in line
+        ):
+            dbMsg = Backups_pb2.BackupFrame()
+            dbMsg.statement.statement = line
+            db_backup.write(f"{line}\n")
+            iv = write_encrypted_backup_frame(dbMsg, backup_file, keys, iv, version)
 
     # # Preferences stored as a dictionary {<file>: {<key>: {<type>: <value>, ...}, ...}, ...}
     # preferences: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    # python -m json.tool preferences.json
     preferences_path = Path(input_directory + "/" + "preferences.json")
     with open(preferences_path, "r") as kv_file:
         jsonData = json.load(kv_file)
@@ -208,13 +228,11 @@ def create_backup_file(backup_file: BinaryIO, passphrase: str, input_directory: 
                     if prefKey == "stringSetValue" and optProperties["isStringSetValue"]:
                         prefMsg.preference.stringSetValue.append(prefValue)
                     if prefKey == "blobValueBase64":
-                        prefMsg.keyValue.blobValue = b64decode(value["blobValueBase64"].encode("ascii"))
+                        prefMsg.keyValue.blobValue = b64decode(prefValue.encode("ascii"))
             
-                serializedMsg = prefMsg.SerializeToString()
-                encrypted_att = encrypt_backup_frame(serializedMsg, hmac_key, cipher_key, iv, version)
-                iv = increment_initialisation_vector(iv)
-                backup_file.write(encrypted_att)
+                iv = write_encrypted_backup_frame(prefMsg, backup_file, keys, iv, version)
 
+    # python -m json.tool key_value.json
     keyvalue_path = Path(input_directory + "/" + "key_value.json")
     with open(keyvalue_path, "r") as kv_file:
         jsonData = json.load(kv_file)
@@ -230,15 +248,7 @@ def create_backup_file(backup_file: BinaryIO, passphrase: str, input_directory: 
             if "blobValueBase64" in valueKeys:
                 kvMsg.keyValue.blobValue = b64decode(value["blobValueBase64"].encode("ascii"))
         
-            serializedMsg = kvMsg.SerializeToString()
-            encrypted_att = encrypt_backup_frame(serializedMsg, hmac_key, cipher_key, iv, version)
-            iv = increment_initialisation_vector(iv)
-            backup_file.write(encrypted_att)
-    
-    keys = Keys(
-        cipher_key=cipher_key,
-        hmac_key=hmac_key,
-    )
+            iv = write_encrypted_backup_frame(kvMsg, backup_file, keys, iv, version)
 
     # Add other files (attachments, avatars, stickers)
     iv = writeAttachmentObj(backup_file, keys, iv, input_directory, "attachments", AttachmentType.ATTACHMENT, version)
