@@ -4,6 +4,7 @@ import json
 import sys
 import secrets
 import os
+import re
 from base64 import b64decode
 from pathlib import Path
 from enum import Enum
@@ -196,10 +197,21 @@ def create_backup_file(backup_file: BinaryIO, passphrase: str, input_directory: 
     dbUserVerMsg.version.version = version
     db_backup.write(f"PRAGMA user_version = {version:d};\n")
     iv = write_encrypted_backup_frame(dbUserVerMsg, backup_file, keys, iv, version)
-    for line in con.iterdump():
+    for row in con.execute("select sql FROM sqlite_master WHERE lower(substr(sql,1,20))='create virtual table'"):
+        dbMsg = Backups_pb2.BackupFrame()
+        dbMsg.statement.statement = row[0]
+        db_backup.write(f"{row[0]}\n")
+        iv = write_encrypted_backup_frame(dbMsg, backup_file, keys, iv, version)
+    fts_tab_re = re.compile("create (?:virtual )?table [\"']?[a-z0-9\-_]+_fts_[a-z0-9]+[\"']?")
+    fts_config_tab_re = re.compile("insert into [\"']?[a-z0-9\-_]+_fts_(?:config|data|docsize|idx)[\"']?") # Internal fts5 table?
+    for line in con.iterdump(): # loool not handling virtual tables
+        lineLow = line.lower()
         if (
-            not line.lower().startswith("create table sqlite_")
-            and not line.lower().startswith("insert into sqlite_")
+            not lineLow.startswith("create table sqlite_")
+            and not lineLow.startswith("insert into sqlite_")
+            and not lineLow.startswith("create virtual table") # in case it someday does
+            and not fts_tab_re.match(lineLow)
+            and not fts_config_tab_re.match(lineLow)
             and "sms_fts_" not in line
             and "mms_fts_" not in line
         ):
